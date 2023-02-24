@@ -1,86 +1,12 @@
-from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from w32py.win import (
-    coInitialize,
-    coUninitialize,
-    dispatch,
-    pumpWaitingMessages,
-    withEvents,
-)
+from w32py.win import pumpWaitingMessages, qApplication, qAxWidget
 
 
 class CALLBACK:
-    OnLogin: list[Callable[[str, str], None]] = []
-    OnDisconnect: list[Callable[[], None]] = []
     OnReceiveData: list[Callable[[dict[str, Any]], None]] = []
     OnReceiveRealData: list[Callable[[dict[str, Any]], None]] = []
-
-
-class SESSION_STATUS(Enum):
-    DISCONNECT = auto()
-    LOGIN_SUCCEEDED = auto()
-    LOGIN_FAILED = auto()
-
-
-class Session:
-    def __init__(self) -> None:
-        self.com: Any = None
-        self.status = SESSION_STATUS.DISCONNECT
-
-    def init(self, com: Any) -> None:
-        self.com = com
-        self.status = SESSION_STATUS.DISCONNECT
-
-    def OnLogin(self, szCode: str, szMsg: str) -> None:
-        if szCode == "0000":
-            self.status = SESSION_STATUS.LOGIN_SUCCEEDED
-        else:
-            self.status = SESSION_STATUS.LOGIN_FAILED
-        for OnLogin in CALLBACK.OnLogin:
-            OnLogin(szCode, szMsg)
-
-    def OnLogout(self) -> None:
-        self.disconnect()
-        for OnDisconnect in CALLBACK.OnDisconnect:
-            OnDisconnect()
-
-    def OnDisconnect(self) -> None:
-        self.disconnect()
-        for OnDisconnect in CALLBACK.OnDisconnect:
-            OnDisconnect()
-
-    def disconnect(self) -> None:
-        self.com.DisconnectServer()
-        self.status = SESSION_STATUS.DISCONNECT
-
-    def lastError(self, prefix: str) -> str:
-        nErrCode = self.com.GetLastError()
-        strErrMsg = self.com.GetErrorMessage(nErrCode)
-        return f"{prefix}, {nErrCode}, {strErrMsg}"
-
-    def login(
-        self,
-        szID: str,
-        szPwd: str,
-        szCertPwd: str,
-        nServerType: int,
-        szServerIP: str,
-        nServerPort: int,
-    ) -> str:
-        self.disconnect()
-        if not self.com.ConnectServer(szServerIP, nServerPort):
-            return self.lastError("ConnectServer")
-        if not self.com.Login(szID, szPwd, szCertPwd, nServerType):
-            return self.lastError("Login")
-
-        while self.status == SESSION_STATUS.DISCONNECT:
-            pumpWaitingMessages()
-
-        if self.status == SESSION_STATUS.LOGIN_SUCCEEDED:
-            return ""
-        return "LOGIN_FAILED"
 
 
 def parse_field(line: str) -> dict[str, Any]:
@@ -88,8 +14,8 @@ def parse_field(line: str) -> dict[str, Any]:
     return {
         "name": cols[1],
         "desc": cols[0],
-        "type": cols[3],
-        "size": cols[4],
+        "type": cols[2],
+        "size": cols[3],
     }
 
 
@@ -103,7 +29,7 @@ def parse_lines(lines: list[str]) -> dict[str, Any]:
         filter(lambda x: x, map(lambda x: x.replace(";", "").strip(), lines))
     )
     for i, line in enumerate(lines):
-        if line.startswith(".Func,") or line.startswith(".Feed,"):
+        if line.startswith("T,") or line.startswith("R,"):
             parsed["desc"] = line.split(",")[1].strip()
         elif line == "begin":
             latest_begin = i
@@ -111,7 +37,7 @@ def parse_lines(lines: list[str]) -> dict[str, Any]:
             block_info = [
                 s.strip() for s in lines[latest_begin - 1].split(",")
             ]
-            parsed[block_info[2]][block_info[0]] = {
+            parsed[block_info[1]][block_info[0]] = {
                 "occurs": block_info[-1].startswith("occurs"),
                 "fields": list(map(parse_field, lines[latest_begin + 1 : i])),
             }
@@ -132,25 +58,30 @@ class Query:
 
     def init(self, com: Any, p: Path) -> None:
         self.com = com
-        self.com.ResFileName = f"{p}"
+        self.com.ReceiveData.connect(self.OnReceiveData)
+        self.com.ReceiveErrorData.connect(self.OnReceiveErrorData)
         self.meta = parse_res(p)
         self.received = False
         self.tr = p.stem
 
-    def OnReceiveData(self, _szTrCode: str) -> None:
+    def OnReceiveData(self) -> None:
         block: dict[str, Any] = {}
-        for szBlockName, v in self.meta["output"].items():
+        for nBlockIdx, (szBlockName, v) in enumerate(
+            self.meta["output"].items()
+        ):
             fields = v["fields"]
             if v["occurs"]:
                 block[szBlockName] = [
-                    self.getBlock(szBlockName, nRecIdx, fields)
-                    for nRecIdx in range(self.com.GetBlockCount(szBlockName))
+                    self.getBlock(nBlockIdx, nRecIdx, fields)
+                    for nRecIdx in range(
+                        self.com.dynamicCall(
+                            "GetMultiRecrodCount(int)", nBlockIdx
+                        )
+                    )
                 ]
             else:
                 nRecIdx = 0
-                block[szBlockName] = self.getBlock(
-                    szBlockName, nRecIdx, fields
-                )
+                block[szBlockName] = self.getBlock(nBlockIdx, nRecIdx, fields)
         responseQuery = {
             "err": "",
             "tr": self.tr,
@@ -160,14 +91,12 @@ class Query:
         for OnReceiveData in CALLBACK.OnReceiveData:
             OnReceiveData(responseQuery)
 
-    def OnReceiveMessage(
-        self, bIsSystemError: int, nMessageCode: str, szMessage: str
-    ) -> None:
-        if bIsSystemError == 0 and nMessageCode[0] == "0":
-            return
-
+    def OnReceiveErrorData(self) -> None:
+        RtCode = self.com.dynamicCall("GetRtCode()")
+        ReqMsgCode = self.com.dynamicCall("GetReqMsgCode()")
+        ReqMessage = self.com.dynamicCall("GetReqMessage()")
         responseQuery = {
-            "err": f"{bIsSystemError}, {nMessageCode}, {szMessage}",
+            "err": f"{RtCode}, {ReqMsgCode}, {ReqMessage}",
             "tr": self.tr,
             "block": {},
         }
@@ -177,25 +106,33 @@ class Query:
 
     def getBlock(
         self,
-        szBlockName: str,
+        nBlockIdx: int,
         nRecIdx: int,
         fields: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        nAttrType = 0
         block: dict[str, Any] = {}
-        for field in fields:
+        for nFieldIdx, field in enumerate(fields):
             szFieldName = field["name"]
-            val = self.com.GetFieldData(szBlockName, szFieldName, nRecIdx)
+            val = self.com.dynamicCall(
+                "GetMultiData(int, int, int, int)",
+                nBlockIdx,
+                nRecIdx,
+                nFieldIdx,
+                nAttrType,
+            )
             block[szFieldName] = f"{val}"
         return block
 
     def setBlock(
         self,
         szBlockName: str,
+        nBlockIdx: int,
         nRecIdx: int,
         fields: list[dict[str, Any]],
         block: dict[str, Any],
     ) -> str:
-        for field in fields:
+        for nFieldIdx, field in enumerate(fields):
             szFieldName = field["name"]
             val = block.get(szFieldName)
             if val is None:
@@ -203,12 +140,20 @@ class Query:
                     f"InvalidField, {szBlockName}"
                     f", {nRecIdx}, {szFieldName}"
                 )
-            self.com.SetFieldData(szBlockName, szFieldName, nRecIdx, f"{val}")
+            self.com.dynamicCall(
+                "SetMultiBlockData(int, int, int, QString)",
+                nBlockIdx,
+                nRecIdx,
+                nFieldIdx,
+                val,
+            )
         return ""
 
     def query(self, requestQuery: dict[str, Any]) -> str:
         requestBlock = requestQuery["block"]
-        for szBlockName, v in self.meta["input"].items():
+        for nBlockIdx, (szBlockName, v) in enumerate(
+            self.meta["input"].items()
+        ):
             fields = v["fields"]
             if v["occurs"]:
                 blocks = requestBlock.get(szBlockName)
@@ -225,7 +170,9 @@ class Query:
                             f"InvalidBlockType, {szBlockName}"
                             f", list, {nRecIdx}, dict, {type(block)}"
                         )
-                    err = self.setBlock(szBlockName, nRecIdx, fields, block)
+                    err = self.setBlock(
+                        szBlockName, nBlockIdx, nRecIdx, fields, block
+                    )
                     if err:
                         return err
             else:
@@ -238,15 +185,16 @@ class Query:
                         f"InvalidBlockType, {szBlockName}"
                         f", dict, {type(block)}"
                     )
-                err = self.setBlock(szBlockName, nRecIdx, fields, block)
+                err = self.setBlock(
+                    szBlockName, nBlockIdx, nRecIdx, fields, block
+                )
                 if err:
                     return err
 
-        nErrCode = self.com.Request(requestQuery["cont"])
-        if nErrCode < 0:
-            strErrMsg = self.com.GetErrorMessage(nErrCode)
-            return f"Request, {nErrCode}, {strErrMsg}"
-
+        if requestQuery["cont"]:
+            self.com.dynamicCall("RequestNextData(QString)", self.tr)
+        else:
+            self.com.dynamicCall("RequestData(QString)", self.tr)
         while not self.received:
             pumpWaitingMessages()
         return ""
@@ -261,16 +209,16 @@ class Real:
 
     def init(self, com: Any, p: Path) -> None:
         self.com = com
-        self.com.ResFileName = f"{p}"
+        self.com.ReceiveRealData.connect(self.OnReceiveRealData)
         self.meta = parse_res(p)
         self.keys = set()
         self.tr = p.stem
 
-    def OnReceiveRealData(self, _szTrCode: str) -> None:
+    def OnReceiveRealData(self) -> None:
         block: dict[str, Any] = {}
         for szBlockName, v in self.meta["output"].items():
             fields = v["fields"]
-            block[szBlockName] = self.getBlock(szBlockName, fields)
+            block[szBlockName] = self.getBlock(fields)
         responseReal = {
             "err": "",
             "tr": self.tr,
@@ -281,13 +229,21 @@ class Real:
 
     def getBlock(
         self,
-        szBlockName: str,
         fields: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        nBlockIdx = 0
+        nRecIdx = 0
+        nAttrType = 0
         block: dict[str, Any] = {}
-        for field in fields:
+        for nFieldIdx, field in enumerate(fields):
             szFieldName = field["name"]
-            val = self.com.GetFieldData(szBlockName, szFieldName)
+            val = self.com.dynamicCall(
+                "GetMultiData(int, int, int, int)",
+                nBlockIdx,
+                nRecIdx,
+                nFieldIdx,
+                nAttrType,
+            )
             block[szFieldName] = f"{val}"
         return block
 
@@ -296,13 +252,7 @@ class Real:
         if key in self.keys:
             return ""
 
-        if key:
-            self.com.SetFieldData(
-                "InBlock",
-                self.meta["input"]["InBlock"]["fields"][0]["name"],
-                key,
-            )
-        self.com.AdviseRealData()
+        self.com.dynamicCall("RequestRealData(QString, QString)", self.tr, key)
         self.keys.add(key)
         return ""
 
@@ -311,41 +261,32 @@ class Real:
         if key not in self.keys:
             return ""
 
-        if key:
-            self.com.UnadviseRealDataWithKey(key)
-        else:
-            self.com.UnadviseRealData()
+        self.com.dynamicCall(
+            "UnRequestRealData(QString, QString)", self.tr, key
+        )
         self.keys.remove(key)
         return ""
 
 
 class Meta:
-    def __init__(self, path: str = "C:/eBEST/xingAPI/Res") -> None:
+    def __init__(
+        self, path: str = "C:/eFriend Expert/efriendexpert/qry"
+    ) -> None:
         self.path = Path(path)
-        self.Session: Optional[Session] = None
         self.QueryDict: dict[str, Query] = {}
         self.RealDict: dict[str, Real] = {}
+        self.app: Any = None
 
     def __enter__(self) -> Any:
-        coInitialize()
+        self.app = qApplication()
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        obj = self.getSession()
-        obj.disconnect()
-        coUninitialize()
+        pass
 
     def exists(self, szTrCode: str) -> tuple[bool, Path]:
-        p = self.path / f"{szTrCode}.res"
+        p = self.path / f"{szTrCode}.qry"
         return p.exists(), p
-
-    def getSession(self) -> Session:
-        if self.Session is None:
-            com = dispatch("XA_Session.XASession")
-            obj = withEvents(com, Session)
-            obj.init(com)
-            self.Session = obj
-        return self.Session
 
     def getQuery(self, szTrCode: str) -> Optional[Query]:
         obj = self.QueryDict.get(szTrCode)
@@ -353,8 +294,8 @@ class Meta:
             b, p = self.exists(szTrCode)
             if not b:
                 return None
-            com = dispatch("XA_DataSet.XAQuery")
-            obj = withEvents(com, Query)
+            com = qAxWidget("ITGExpertCtl.ITGExpertCtlCtrl.1")
+            obj = Query()
             obj.init(com, p)
             self.QueryDict[szTrCode] = obj
         return obj
@@ -365,25 +306,11 @@ class Meta:
             b, p = self.exists(szTrCode)
             if not b:
                 return None
-            com = dispatch("XA_DataSet.XAReal")
-            obj = withEvents(com, Real)
+            com = qAxWidget("ITGExpertCtl.ITGExpertCtlCtrl.1")
+            obj = Real()
             obj.init(com, p)
             self.RealDict[szTrCode] = obj
         return obj
-
-    def login(
-        self,
-        szID: str,
-        szPwd: str,
-        szCertPwd: str,
-        nServerType: int = 0,
-        szServerIP: str = "hts.ebestsec.co.kr",
-        nServerPort: int = 20001,
-    ) -> str:
-        obj = self.getSession()
-        return obj.login(
-            szID, szPwd, szCertPwd, nServerType, szServerIP, nServerPort
-        )
 
     def query(self, requestQuery: dict[str, Any]) -> str:
         """
