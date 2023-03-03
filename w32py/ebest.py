@@ -72,7 +72,7 @@ class Session:
         self.disconnect()
         if not self.com.ConnectServer(szServerIP, nServerPort):
             return self.lastError("ConnectServer")
-        if not self.com.Login(szID, szPwd, szCertPwd, nServerType):
+        if not self.com.Login(szID, szPwd, szCertPwd, nServerType, False):
             return self.lastError("Login")
 
         while self.status == SESSION_STATUS.DISCONNECT:
