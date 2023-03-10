@@ -25,8 +25,8 @@ Home = "https://github.com/nanticj/w32py"
 develop = [
     "black >=23.1,<23.2",
     "isort >=5.12,<5.13",
-    "mypy >=1.0,<=1.1",
-    "pylint >=2.16,<2.17",
+    "mypy >=1.0,<1.1",
+    "pylint >=2.17,<2.18",
     "pytest >=7.2,<7.3",
     "types-pytz >=2022.7,<2022.8",
 ]
