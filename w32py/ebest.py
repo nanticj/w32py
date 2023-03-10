@@ -1,6 +1,6 @@
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from w32py.win import (
     coInitialize,
@@ -322,7 +322,7 @@ class Real:
 class Meta:
     def __init__(self, path: str = "C:/eBEST/xingAPI/Res") -> None:
         self.path = Path(path)
-        self.Session: Optional[Session] = None
+        self.Session: None | Session = None
         self.QueryDict: dict[str, Query] = {}
         self.RealDict: dict[str, Real] = {}
 
@@ -347,7 +347,7 @@ class Meta:
             self.Session = obj
         return self.Session
 
-    def getQuery(self, szTrCode: str) -> Optional[Query]:
+    def getQuery(self, szTrCode: str) -> None | Query:
         obj = self.QueryDict.get(szTrCode)
         if obj is None:
             b, p = self.exists(szTrCode)
@@ -359,7 +359,7 @@ class Meta:
             self.QueryDict[szTrCode] = obj
         return obj
 
-    def getReal(self, szTrCode: str) -> Optional[Real]:
+    def getReal(self, szTrCode: str) -> None | Real:
         obj = self.RealDict.get(szTrCode)
         if obj is None:
             b, p = self.exists(szTrCode)
